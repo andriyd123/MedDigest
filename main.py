@@ -51,7 +51,16 @@ def main():
 
     # Initialize and run the research digest generation
     digest = ResearchDigest(api_key)
-    digest.generate_digest()
+    digest_json = digest.generate_digest()
+    digest.digest_json = digest_json  # Store the digest JSON for Newsletter
+
+    # Generate the newsletter
+    from Output_Generation.newsletter import Newsletter
+    newsletter = Newsletter(digest)
+    newsletter.generate_newsletter()
+    
+    # Print token usage summary
+    digest.token_monitor.print_usage_summary()
 
 # Entry point guard to ensure script runs only when executed directly
 if __name__ == "__main__":

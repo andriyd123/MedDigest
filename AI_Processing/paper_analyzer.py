@@ -1,16 +1,19 @@
 # Local imports for data structures and AI processing
 from Data_Classes.classes import Paper, PaperAnalysis
 from langchain_groq import ChatGroq
-from utils.token_monitor import TokenMonitor
+from utils.token_monitor import TokenMonitor, TokenUsage
 from pydantic import SecretStr
 import logging
 import re
 import json
 from typing import Optional
+from transformers import AutoTokenizer
 
 # Configure logging for this module
 logger = logging.getLogger(__name__)
 
+# Initialize the tokenizer globally (using open access tokenizer)
+llama_tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
 
 class PaperAnalyzer:
     """
@@ -25,42 +28,61 @@ class PaperAnalyzer:
     # Set of valid medical specialties for categorization
     VALID_SPECIALTIES = {
         'Cardiology', 'Oncology', 'Radiology', 'Neurology', 
-        'Surgery', 'Psychiatry', 'Endocrinology', 'General Medicine'
+        'Surgery', 'Psychiatry', 'Endocrinology', 'General Medicine',
+        'Dermatology', 'Gastroenterology', 'Pulmonology', 'Orthopedics',
+        'Ophthalmology', 'Urology', 'Gynecology', 'Pediatrics',
+        'Emergency Medicine', 'Anesthesiology', 'Pathology', 'Immunology',
+        'Infectious Disease', 'Nephrology', 'Hematology', 'Rheumatology',
+        'Medical Imaging', 'Biomedical Engineering', 'Medical AI', 'Clinical Research'
     }
     
     # System prompt that defines the AI's role and analysis requirements
-    SYSTEM_ROLE = """You are an expert medical research analyst with deep knowledge across all medical specialties. 
-Your task is to analyze medical research papers and provide accurate categorization and key insights.
-Focus on:
-- Identifying the primary medical specialty based on the paper's content and methodology
-- Extracting the most relevant medical concepts and terminology
-- Providing a concise but comprehensive summary that captures the key findings
-Be precise and professional in your analysis."""
+    SYSTEM_ROLE = """
+    You are an expert medical research analyst with deep knowledge across all medical specialties. 
+    Your task is to analyze medical research papers and provide accurate categorization and key insights.
+    Focus on:
+    - Identifying the primary medical specialty based on the paper's content and methodology
+    - Extracting the most relevant medical concepts and terminology
+    - Providing a concise but comprehensive summary that captures the key findings
+    Be precise and professional in your analysis.
+    """
     
-    def __init__(self, api_key: str, token_monitor: Optional[TokenMonitor] = None):
+    def __init__(self, api_key: str, token_monitor: TokenMonitor):
         """
         Initialize the paper analyzer with Groq LLM.
         
         Args:
             api_key (str): API key for Groq LLM service
-            token_monitor (Optional[TokenMonitor]): Token monitor for monitoring usage
+            token_monitor: TokenMonitor instance for recording token usage
         """
         self.llm = ChatGroq(api_key=SecretStr(api_key), model="llama3-8b-8192")
-        self.token_monitor = token_monitor or TokenMonitor()
+        self.token_monitor = token_monitor
     
-    def analyze_paper(self, paper: Paper):
+    def analyze_paper(self, paper: Paper) -> tuple[Optional[PaperAnalysis], Optional[TokenUsage]]:
+        """
+        Analyze a paper using AI to determine its specialty and key concepts.
+        
+        Args:
+            paper (Paper): The paper to analyze
+            
+        Returns:
+            tuple[Optional[PaperAnalysis], Optional[TokenUsage]]: Analysis results and token usage if successful, (None, None) if analysis fails
+            
+        Note:
+            The analysis includes specialty categorization, keyword extraction,
+            and a focused summary of the paper's main findings.
+        """
         prompt = self._create_analysis_prompt(paper)
         try:
             input_text = self.SYSTEM_ROLE + prompt
-            estimated_input_tokens = len(input_text) // 4
+            input_tokens = self.token_monitor.count_tokens(input_text)
             response = self.llm.invoke(
                 input=[
                     {"role": "system", "content": self.SYSTEM_ROLE},
                     {"role": "user", "content": prompt}
                 ]
             )
-            input_tokens = estimated_input_tokens
-            output_tokens = len(str(response.content)) // 4
+            output_tokens = self.token_monitor.count_tokens(str(response.content))
             usage = self.token_monitor.record_usage(
                 input_tokens=input_tokens,
                 output_tokens=output_tokens
@@ -86,25 +108,27 @@ Be precise and professional in your analysis."""
             for the analysis format and requirements.
         """
         return f"""
-        Analyze this medical research paper:
+        Analyze this medical research paper and provide a JSON response with the exact structure shown below.
         
         Title: {paper.title}
-        Abstract: {paper.abstract[:500]}
+        Abstract: {paper.abstract}
         Conclusion: {paper.conclusion}
-        Authors: {', '.join(paper.authors[:5])}
+        Authors: {', '.join(paper.authors)}
         arXiv Categories: {', '.join(paper.categories)}
         
-        Provide:
-        1. Summary of the paper in one paragraph. Write 2-3 sentences about the abstract and 2-3 sentences about the conclusion.
-        2. Medical specialty (ONE of: {', '.join(sorted(self.VALID_SPECIALTIES))})
-        3. 5 key medical concepts/terms from this research
+        Instructions:
+        1. Write a 2-3 sentence summary of the paper's key findings
+        2. Identify the primary medical specialty from this list: {', '.join(sorted(self.VALID_SPECIALTIES))}
+        3. Extract 5 key medical concepts/terms from this research
         
-        Format your response as a JSON object with the following structure:
+        IMPORTANT: Return ONLY a valid JSON object with this exact structure:
         {{
-            "summary": "summary of the paper",
-            "specialty": "medical specialty",
+            "summary": "2-3 sentence summary of the paper's key findings",
+            "specialty": "exact specialty name from the provided list",
             "keywords": ["keyword1", "keyword2", "keyword3", "keyword4", "keyword5"]
         }}
+        
+        Do not include any text before or after the JSON object. Ensure all quotes are properly escaped.
         """
     
     def _parse_analysis_response(self, response: str) -> Optional[PaperAnalysis]:
@@ -122,31 +146,71 @@ Be precise and professional in your analysis."""
             required fields, and specialty categorization.
         """
         try:
+            # Clean the response - remove any markdown formatting
+            cleaned_response = response.strip()
+            if cleaned_response.startswith('```json'):
+                cleaned_response = cleaned_response[7:]
+            if cleaned_response.endswith('```'):
+                cleaned_response = cleaned_response[:-3]
+            cleaned_response = cleaned_response.strip()
+            
             # Find JSON object in the response
-            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            json_match = re.search(r'\{.*\}', cleaned_response, re.DOTALL)
             if not json_match:
-                logger.error(f"Could not find JSON in response: {response}")
+                logger.error(f"Could not find JSON in response: {response[:200]}...")
                 return None
                 
             json_str = json_match.group(0)
             data = json.loads(json_str)
             
-            # Validate required fields
-            if not all(key in data for key in ['summary', 'specialty', 'keywords']):
-                logger.error(f"Missing required fields in response: {data}")
+            # Validate and sanitize required fields
+            summary = data.get('summary')
+            if not isinstance(summary, str):
+                summary = str(summary) if summary is not None else ''
+            
+            keywords = data.get('keywords')
+            if not isinstance(keywords, list):
+                keywords = []
+            else:
+                # Ensure all keywords are strings
+                keywords = [str(kw) for kw in keywords if isinstance(kw, (str, int, float))]
+            keywords = keywords[:5]
+            
+            specialty = data.get('specialty')
+            if not isinstance(specialty, str):
+                logger.error(f"Invalid specialty type: {type(specialty)}")
                 return None
                 
-            # Validate specialty
-            if data['specialty'] not in self.VALID_SPECIALTIES:
-                logger.error(f"Invalid specialty: {data['specialty']}")
-                return None
+            # Try to match specialty with valid ones (case-insensitive)
+            specialty_lower = specialty.lower()
+            matched_specialty = None
+            for valid_specialty in self.VALID_SPECIALTIES:
+                if valid_specialty.lower() == specialty_lower:
+                    matched_specialty = valid_specialty
+                    break
+            
+            if not matched_specialty:
+                # Try partial matching for common variations
+                for valid_specialty in self.VALID_SPECIALTIES:
+                    if any(word in specialty_lower for word in valid_specialty.lower().split()):
+                        matched_specialty = valid_specialty
+                        break
                 
+                if not matched_specialty:
+                    logger.error(f"Invalid specialty: {specialty}")
+                    return None
+            
             return PaperAnalysis(
-                specialty=data['specialty'],
-                keywords=data['keywords'][:5],  # Ensure we only take up to 5 keywords
-                focus=data['summary']  # Use the summary as the focus
+                specialty=matched_specialty,
+                keywords=keywords,
+                focus=summary
             )
             
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {str(e)}")
+            logger.error(f"Response content: {response[:300]}...")
+            return None
         except Exception as e:
             logger.error(f"Error parsing analysis response: {str(e)}")
+            logger.error(f"Response content: {response[:300]}...")
             return None

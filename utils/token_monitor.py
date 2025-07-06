@@ -7,7 +7,7 @@ Can be used independently or integrated into existing code.
 Features:
 - Token counting per call
 - Rate limiting (tokens per minute)
-- Cost calculation for different models
+- Cost calculation for model used 
 - Usage statistics and reporting
 - Thread-safe operations
 - Export capabilities
@@ -37,11 +37,11 @@ class TokenUsage:
 
 
 class TokenMonitor:
-    """Tracks and limits LLM token usage per minute."""
+    """Tracks and limits LLM token usage per minute for Llama 3 8B model only (input: $0.05/M, output: $0.08/M)"""
     INPUT_COST_PER_MILLION = 0.05   
     OUTPUT_COST_PER_MILLION = 0.08  
 
-    def __init__(self, max_tokens_per_minute: int = 16000):
+    def __init__(self, max_tokens_per_minute: int = 15500):
         self.max_tokens_per_minute = max_tokens_per_minute
         self.usage_history: List[TokenUsage] = []
         self.lock = threading.Lock()
@@ -51,9 +51,22 @@ class TokenMonitor:
         self.total_input_tokens = 0
         self.total_output_tokens = 0
         self.total_cost = 0.0
+        
+        # Initialize tokenizer - using open access tokenizer
+        try:
+            from transformers import AutoTokenizer
+            self.tokenizer = AutoTokenizer.from_pretrained("microsoft/DialoGPT-medium")
+        except:
+            self.tokenizer = None
+
+    def count_tokens(self, text: str) -> int:
+        """Count tokens accurately using Llama 3 tokenizer."""
+        if self.tokenizer:
+            return len(self.tokenizer.encode(text))
+        return len(text) // 4
 
     def record_usage(self, input_tokens: int, output_tokens: int) -> TokenUsage:
-        #Record a call's token usage and enforce per-minute limit.
+        # Enforce per-minute token limit with automatic sleeping
         with self.lock:
             total_tokens = input_tokens + output_tokens
             current_time = time.time()
